@@ -6,45 +6,63 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T>(path: string, { token, body, method, signal }: {
-  token?: string; body?: unknown; method?: string; signal?: AbortSignal;
-} = {}): Promise<T> {
+let activeUser: string | undefined;
+
+export function setRequestUser(userId?: string) {
+  activeUser = userId;
+}
+
+type RequestOptions = { body?: unknown; method?: string; signal?: AbortSignal };
+
+async function request<T>(path: string, { body, method = 'GET', signal }: RequestOptions = {}): Promise<{ data: T; hasNext: boolean }> {
   const headers = new Headers({ Accept: 'application/json' });
+  const account = activeUser;
   if (body !== undefined) headers.set('Content-Type', 'application/json');
-  if (token) headers.set('Authorization', `Bearer ${token}`);
+  if (method !== 'GET') headers.set('X-IndoKerja-Request', '1');
+  if (account && path !== '/auth/me') headers.set('X-IndoKerja-User', account);
 
   const response = await fetch(`/api${path}`, { method, signal, headers, body: JSON.stringify(body) });
-  if (response.status === 401 && token) window.dispatchEvent(new CustomEvent('session-expired', { detail: token }));
-  const data = await response.json().catch(() => null);
+  if (response.status === 401 && !signal?.aborted && account && account === activeUser && path !== '/auth/session' && path !== '/auth/me') {
+    window.dispatchEvent(new Event('session-expired'));
+  }
+  const data = response.status === 204 ? undefined : await response.json().catch(() => null);
   if (!response.ok || data === null) {
     const error = data?.error;
     throw new ApiError(response.status, error?.code ?? 'REQUEST_FAILED',
       error?.message ?? 'Layanan belum dapat dihubungi. Silakan coba lagi.', error?.fields);
   }
-  return data;
+  return { data, hasNext: response.headers.get('Link')?.includes('rel="next"') ?? false };
+}
+
+export async function api<T>(path: string, options?: RequestOptions): Promise<T> {
+  return (await request<T>(path, options)).data;
 }
 
 export function errorMessage(error: unknown) {
   return error instanceof ApiError ? error.message : 'Koneksi bermasalah. Silakan coba lagi.';
 }
 
-type Result<T> = { key: string; data: T; error?: never } | { key: string; error: string; data?: never };
+type Result<T> =
+  | { key: string; data: T; hasNext: boolean; error?: never }
+  | { key: string; error: string; data?: never; hasNext?: never };
 
-export function useResource<T>(path: string, token?: string) {
+export function useResource<T>(path: string) {
   const [version, setVersion] = useState(0);
-  const key = JSON.stringify([path, token, version]);
+  const key = JSON.stringify([path, version]);
   const [result, setResult] = useState<Result<T>>();
   useEffect(() => {
     const controller = new AbortController();
-    api<T>(path, { token, signal: controller.signal }).then(
-      data => { if (!controller.signal.aborted) setResult({ key, data }); },
+    request<T>(path, { signal: controller.signal }).then(
+      result => { if (!controller.signal.aborted) setResult({ key, ...result }); },
       error => { if (!controller.signal.aborted) setResult({ key, error: errorMessage(error) }); },
     );
     return () => controller.abort();
-  }, [key, path, token]);
+  }, [key, path]);
+  const current = result?.key === key ? result : undefined;
   return {
-    data: result?.key === key ? result.data : undefined,
-    error: result?.key === key ? result.error : undefined,
+    data: current?.data,
+    error: current?.error,
+    hasNext: current?.hasNext ?? false,
     reload: () => setVersion(value => value + 1),
   };
 }

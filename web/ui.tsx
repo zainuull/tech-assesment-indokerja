@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
 import { AlertCircle, ArrowLeft, BriefcaseBusiness, Building2, CircleCheck, Clock3, MapPin, Wallet } from 'lucide-react';
 import { Link, type To } from 'react-router-dom';
-import { jobTypes, statuses, type Job, type Status } from '../shared/domain';
+import { jobStates, jobTypes, statuses, type HistoryEntry, type Job, type JobState, type Status } from '../shared/domain';
 
 const dateFormat = new Intl.DateTimeFormat('id-ID', { dateStyle: 'medium', timeStyle: 'short' });
 const moneyFormat = new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 });
@@ -51,4 +51,24 @@ export function JobFacts({ job }: { job: Job }) {
 
 export function JobTypeOptions() {
   return <>{Object.entries(jobTypes).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</>;
+}
+
+export function JobStateBadge({ state }: { state: JobState }) {
+  return <span className={`status-badge job-state-${state.toLowerCase()}`}><span aria-hidden="true" />{jobStates[state]}</span>;
+}
+
+export function StageTimeline({ history }: { history: HistoryEntry[] }) {
+  if (!history.length) return <p>Belum ada riwayat status.</p>;
+  return <ol className="timeline">{history.map(entry => <li key={entry.id}>
+    <strong>{entry.fromStatus ? `${statuses[entry.fromStatus]} → ` : ''}{statuses[entry.toStatus]}</strong>
+    <time dateTime={entry.changedAt}>{date(entry.changedAt)}</time>
+  </li>)}</ol>;
+}
+
+export function Field({ name, label, error, children }: { name: string; label: string; error?: string; children: ReactNode }) {
+  return <div className="field"><label htmlFor={name}>{label}</label>{children}{error && <span className="field-error" id={`${name}-error`}>{error}</span>}</div>;
+}
+
+export function fieldProps(name: string, errors: Record<string, string>) {
+  return { id: name, name, required: true, 'aria-invalid': !!errors[name], 'aria-describedby': errors[name] ? `${name}-error` : undefined };
 }

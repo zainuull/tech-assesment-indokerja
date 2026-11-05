@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { JobType, Role } from '../generated/prisma/client';
+import { JobState, JobType, Role, type ApplicationStatus } from '../generated/prisma/client';
 import { createDb } from '../server/db';
 import { hashPassword } from '../server/password';
 
@@ -23,7 +23,16 @@ const listings = [
     'Bantu pelanggan menyelesaikan kendala melalui kanal dukungan dan sampaikan masukan pelanggan kepada tim produk.'],
   ['Backend Engineer', 'Remote', 13_000_000, 20_000_000, JobType.FULL_TIME,
     'Bangun dan rawat REST API menggunakan Node.js dan PostgreSQL. Tulis pengujian serta pantau keandalan layanan.'],
+  ['UI Engineer', 'Jakarta Selatan', 11_000_000, 17_000_000, JobType.FULL_TIME,
+    'Rancang dan implementasikan komponen antarmuka yang digunakan lintas produk.', JobState.DRAFT],
+  ['QA Analyst', 'Remote', 7_000_000, 11_000_000, JobType.CONTRACT,
+    'Uji fitur baru, dokumentasikan temuan, dan bantu tim memastikan perbaikan berjalan.', JobState.CLOSED],
 ] as const;
+
+const demoCandidates: [string, ApplicationStatus][] = [
+  ['Alya Putri', 'APPLIED'], ['Naufal Ramadhan', 'APPLIED'], ['Intan Lestari', 'REVIEWING'],
+  ['Dimas Saputra', 'SHORTLISTED'], ['Maya Adinata', 'ACCEPTED'], ['Fajar Mahendra', 'REJECTED'],
+];
 
 try {
   await db.$transaction(async tx => {
@@ -36,18 +45,18 @@ try {
     const [seeker, digital, sagara, nusa] = await Promise.all(accounts.map(([name, email, role]) => tx.user.upsert({
       where: { email }, update: {}, create: { name, email, role, passwordHash },
     })));
-    const owners = [digital, sagara, nusa, digital, sagara, nusa];
-    const jobs = await Promise.all(listings.map(([title, location, salaryMin, salaryMax, jobType, description], index) => {
+    const owners = [digital, sagara, nusa, digital, sagara, nusa, digital, digital];
+    const jobs = await Promise.all(listings.map(([title, location, salaryMin, salaryMax, jobType, description, state = JobState.OPEN], index) => {
       const id = `a1900000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`;
       return tx.job.upsert({
         where: { id }, update: {},
-        create: { id, title, location, salaryMin, salaryMax, jobType, description, companyId: owners[index].id,
+        create: { id, title, location, salaryMin, salaryMax, jobType, description, state, companyId: owners[index].id,
           createdAt: new Date(Date.now() - index * 3_600_000) },
       });
     }));
     const jobId = jobs[3].id;
     const seekerId = seeker.id;
-    await tx.application.upsert({
+    if (jobs[3].state === 'OPEN') await tx.application.upsert({
       where: { jobId_seekerId: { jobId, seekerId } },
       update: {},
       create: {
@@ -58,6 +67,31 @@ try {
         ] },
       },
     });
+    const demoJob = jobs[0];
+    // Demo applications must obey the same publication rule as real applications.
+    for (const [index, [name, status]] of demoJob.state === 'OPEN' ? demoCandidates.entries() : []) {
+      const email = `kandidat.${index + 1}@indokerja.test`;
+      const applicant = await tx.user.upsert({
+        where: { email }, update: {}, create: { name, email, role: Role.JOB_SEEKER, passwordHash },
+      });
+      const jobId = demoJob.id;
+      const appliedAt = new Date(Date.now() - (index + 2) * 3_600_000);
+      await tx.application.upsert({
+        where: { jobId_seekerId: { jobId, seekerId: applicant.id } },
+        update: {},
+        create: {
+          jobId, seekerId: applicant.id, appliedAt, status,
+          history: { create: [
+            { changedBy: applicant.id, toStatus: 'APPLIED', changedAt: appliedAt },
+            ...(status === 'APPLIED' ? [] : [{
+              changedBy: digital.id, fromStatus: 'APPLIED' as const, toStatus: status,
+              changedAt: new Date(appliedAt.getTime() + 3_600_000),
+            }]),
+          ] },
+          ...(status === 'SHORTLISTED' ? { notes: { create: { body: 'Contoh catatan. Portofolio menunjukkan pengalaman membangun komponen React yang aksesibel.' } } } : {}),
+        },
+      });
+    }
   });
   console.log('Akun dan lowongan demo siap.');
 } finally {

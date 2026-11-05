@@ -19,6 +19,12 @@ enum JobType {
   INTERNSHIP
 }
 
+enum JobState {
+  DRAFT
+  OPEN
+  CLOSED
+}
+
 enum ApplicationStatus {
   APPLIED
   REVIEWING
@@ -37,6 +43,7 @@ model User {
   jobs           Job[]
   applications   Application[]
   statusChanges  ApplicationHistory[]
+  sessions       AuthSession[]
 }
 
 model Job {
@@ -49,12 +56,14 @@ model Job {
   salaryMin    Int
   salaryMax    Int
   jobType      JobType
+  state        JobState      @default(OPEN)
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
   applications Application[]
 
   @@index([companyId, createdAt])
   @@index([createdAt])
+  @@index([state, createdAt])
 }
 
 model Application {
@@ -67,9 +76,11 @@ model Application {
   appliedAt DateTime             @default(now())
   updatedAt DateTime             @updatedAt
   history   ApplicationHistory[]
+  notes     CandidateNote[]
 
   @@unique([jobId, seekerId])
   @@index([seekerId, appliedAt])
+  @@index([jobId, appliedAt(sort: Desc), id])
 }
 
 model ApplicationHistory {
@@ -83,4 +94,24 @@ model ApplicationHistory {
   changedAt     DateTime           @default(now())
 
   @@index([applicationId, id])
+}
+
+model CandidateNote {
+  id            Int         @id @default(autoincrement())
+  applicationId String      @db.Uuid
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Restrict)
+  body          String
+  createdAt     DateTime    @default(now())
+
+  @@index([applicationId, id])
+}
+
+model AuthSession {
+  tokenHash String   @id @db.Char(64)
+  userId    String   @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime @db.Timestamptz(3)
+
+  @@index([expiresAt])
+  @@index([userId])
 }

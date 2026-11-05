@@ -1,9 +1,9 @@
 import { useRef, useState, type FormEvent } from 'react';
-import { ArrowRight, BriefcaseBusiness, ClipboardList, Compass, MapPin, Search, SlidersHorizontal } from 'lucide-react';
+import { ArrowLeft, ArrowRight, BriefcaseBusiness, ClipboardList, Compass, MapPin, Search, SlidersHorizontal } from 'lucide-react';
 import { Link, useLocation, useParams, useSearchParams } from 'react-router-dom';
-import { statuses, type Application, type Job, type Session } from '../shared/domain';
+import { statusDescriptions, type Application, type Job, type User } from '../shared/domain';
 import { api, ApiError, errorMessage, useResource } from './api';
-import { Back, CompanyMark, date, Empty, Feedback, JobFacts, JobTypeOptions, Pending, StatusBadge } from './ui';
+import { Back, CompanyMark, date, Empty, Feedback, JobFacts, JobStateBadge, JobTypeOptions, Pending, StageTimeline, StatusBadge } from './ui';
 
 export function CareerMap() {
   return <svg className="career-map" viewBox="0 0 530 280" fill="none" aria-hidden="true">
@@ -32,6 +32,7 @@ export function CareerMap() {
 export function JobList() {
   const [params, setParams] = useSearchParams();
   const query = params.toString();
+  const page = Number(params.get('page') ?? 1);
   const resource = useResource<Job[]>(`/jobs${query ? `?${query}` : ''}`);
   const jobs = resource.data;
   const resultsHeading = useRef<HTMLHeadingElement>(null);
@@ -46,6 +47,13 @@ export function JobList() {
     }
     setParams(next);
     resultsHeading.current?.focus();
+  }
+
+  function pageLink(target: number) {
+    const next = new URLSearchParams(params);
+    if (target === 1) next.delete('page');
+    else next.set('page', String(target));
+    return { pathname: '/', search: next.toString() };
   }
 
   return <>
@@ -70,18 +78,27 @@ export function JobList() {
           {jobs && <span className="count" role="status">{jobs.length} lowongan</span>}</div>
       </div>
       {!jobs ? <Pending {...resource} /> : jobs.length === 0 ?
-        <Empty title="Lowongan belum ditemukan"><p>{query ? 'Ubah kata kunci atau hapus filter untuk melihat lowongan lain.' : 'Lowongan yang dipublikasikan perusahaan akan muncul di sini.'}</p></Empty> :
+        <Empty title="Lowongan belum ditemukan"><p>{page > 1 ? 'Tidak ada lowongan pada halaman ini.' : query ? 'Ubah kata kunci atau hapus filter untuk melihat lowongan lain.' : 'Lowongan yang dipublikasikan perusahaan akan muncul di sini.'}</p></Empty> :
         <ul className="job-grid">{jobs.map(job => <li className="job-card" key={job.id}>
           <div className="job-card-head"><CompanyMark name={job.company.name} /><span className="job-company">{job.company.name}</span></div>
           <h3>{job.title}</h3>
           <JobFacts job={job} />
           <div className="card-footer"><Link className="detail-link" aria-label={`Lihat detail ${job.title}`} to={`/lowongan/${job.id}`} state={{ jobSearch: query }}>Lihat detail <ArrowRight size={17} aria-hidden="true" /></Link></div>
         </li>)}</ul>}
+      {jobs && (page > 1 || resource.hasNext) && <nav className="pagination" aria-label="Halaman lowongan">
+        {page > 1 && <Link className="button secondary" to={pageLink(page - 1)} onClick={() => resultsHeading.current?.focus()}>
+          <ArrowLeft size={17} aria-hidden="true" /> Sebelumnya
+        </Link>}
+        <span className="count" aria-current="page">Halaman {page}</span>
+        {resource.hasNext && <Link className="button secondary" to={pageLink(page + 1)} onClick={() => resultsHeading.current?.focus()}>
+          Berikutnya <ArrowRight size={17} aria-hidden="true" />
+        </Link>}
+      </nav>}
     </section>
   </>;
 }
 
-export function JobDetail({ session }: { session: Session | null }) {
+export function JobDetail({ session }: { session: User | null }) {
   const { id } = useParams();
   const { state } = useLocation();
   const resource = useResource<Job>(`/jobs/${id}`);
@@ -91,7 +108,7 @@ export function JobDetail({ session }: { session: Session | null }) {
   </>;
 }
 
-function JobDescription({ job, session }: { job: Job; session: Session | null }) {
+function JobDescription({ job, session }: { job: Job; session: User | null }) {
   const location = useLocation();
   return <>
     <div className="page-heading detail-heading">
@@ -102,32 +119,36 @@ function JobDescription({ job, session }: { job: Job; session: Session | null })
       <section className="surface"><h2>Tentang pekerjaan ini</h2><p className="description">{job.description}</p></section>
       <aside className="surface action-panel">
         <div className="eyebrow">LAMARAN</div>
-        <h2>Lamar pekerjaan ini</h2>
-        {!session ? <><p>Masuk sebagai Pencari Kerja untuk mengirim lamaran.</p>
+        <h2>{job.state === 'CLOSED' ? 'Lowongan ditutup' : 'Lamar pekerjaan ini'}</h2>
+        {job.state === 'CLOSED' ? <><p>Perusahaan sudah menutup penerimaan lamaran baru.</p>
+          {session?.role === 'JOB_SEEKER' && <Link className="button secondary" to="/lamaran">Lihat lamaran saya</Link>}</> :
+          !session ? <><p>Masuk sebagai Pencari Kerja untuk mengirim lamaran.</p>
           <Link className="button primary" to="/masuk" state={{ fromJob: location.pathname, jobSearch: location.state?.jobSearch }}>Masuk untuk melamar</Link></> :
-          session.user.role === 'JOB_SEEKER' ? <Apply job={job} token={session.token} /> :
+          session.role === 'JOB_SEEKER' ? <Apply job={job} /> :
           <p>Lowongan ini dapat dilamar oleh akun Pencari Kerja.</p>}
       </aside>
     </div>
   </>;
 }
 
-function Apply({ job, token }: { job: Job; token: string }) {
-  const resource = useResource<Application[]>('/applications/me', token);
+function Apply({ job }: { job: Job }) {
+  const resource = useResource<{ applied: boolean; state: Job['state'] }>(`/jobs/${job.id}/application`);
   const [busy, setBusy] = useState(false);
   const [applied, setApplied] = useState(false);
+  const [closed, setClosed] = useState(false);
   const [message, setMessage] = useState('');
-  const existing = resource.data?.some(item => item.jobId === job.id);
+  const existing = resource.data?.applied;
 
   async function apply() {
     setBusy(true);
     setMessage('');
     try {
-      await api(`/jobs/${job.id}/applications`, { method: 'POST', token });
+      await api(`/jobs/${job.id}/applications`, { method: 'POST' });
       setApplied(true);
       setMessage('Lamaran berhasil dikirim.');
     } catch (error) {
       if (error instanceof ApiError && error.code === 'ALREADY_APPLIED') setApplied(true);
+      if (error instanceof ApiError && error.code === 'JOB_CLOSED') setClosed(true);
       setMessage(errorMessage(error));
     } finally {
       setBusy(false);
@@ -137,27 +158,35 @@ function Apply({ job, token }: { job: Job; token: string }) {
   if (applied || existing) return <><Feedback kind="success">{message || 'Kamu sudah melamar lowongan ini.'}</Feedback>
     <Link className="button secondary" to="/lamaran">Lihat lamaran saya <ArrowRight size={17} aria-hidden="true" /></Link></>;
   if (!resource.data) return <Pending {...resource} />;
+  if (resource.data.state === 'CLOSED' || closed) return <p>Perusahaan sudah menutup penerimaan lamaran baru.</p>;
   return <><p>Lamaran akan dikirim menggunakan akun Pencari Kerja kamu.</p>
     {message && <Feedback>{message}</Feedback>}
     <button className="button primary" type="button" disabled={busy} onClick={apply}>{busy ? 'Mengirim…' : 'Lamar sekarang'} <ArrowRight size={17} aria-hidden="true" /></button></>;
 }
 
-export function MyApplications({ token }: { token: string }) {
-  const resource = useResource<(Application & { job: Job })[]>('/applications/me', token);
+export function MyApplications() {
+  const resource = useResource<(Application & { job: Job })[]>('/applications/me');
   return <>
     <div className="page-heading"><div className="eyebrow"><ClipboardList size={17} aria-hidden="true" /> PENCARI KERJA</div><h1>Lamaran saya</h1><p>Lihat status terbaru dan riwayat proses seleksi setiap lamaran.</p></div>
     {!resource.data ? <Pending {...resource} /> : resource.data.length === 0 ?
       <Empty title="Belum ada lamaran"><p>Lowongan yang kamu lamar akan muncul di sini.</p><Link className="button primary" to="/">Jelajahi lowongan</Link></Empty> :
-      <ul className="stack">{resource.data.map(application => <li key={application.id} className="surface application-card">
-        <div className="application-head"><CompanyMark name={application.job.company.name} /><div>
-          <div className="job-company">{application.job.company.name}</div>
-          <h2><Link to={`/lowongan/${application.job.id}`}>{application.job.title}</Link></h2>
-          <p>Dilamar <time dateTime={application.appliedAt}>{date(application.appliedAt)}</time></p>
-        </div><StatusBadge status={application.status} /></div>
-        <details><summary>Riwayat status <span className="count">{application.history.length}</span></summary>
-          <ol className="timeline">{application.history.map(entry => <li key={entry.id}><strong>{entry.fromStatus ? `${statuses[entry.fromStatus]} → ` : ''}{statuses[entry.toStatus]}</strong>
-            <time dateTime={entry.changedAt}>{date(entry.changedAt)}</time></li>)}</ol>
-        </details>
-      </li>)}</ul>}
+      <ul className="stack">{resource.data.map(application => {
+        const lastChange = application.history.at(-1)?.changedAt ?? application.appliedAt;
+        return <li key={application.id} className="surface application-card">
+          <div className="application-head"><CompanyMark name={application.job.company.name} /><div>
+            <div className="job-company">{application.job.company.name}</div>
+            <h2><Link to={`/lowongan/${application.job.id}`}>{application.job.title}</Link></h2>
+            <p>Dilamar <time dateTime={application.appliedAt}>{date(application.appliedAt)}</time></p>
+          </div>{application.job.state === 'CLOSED' && <JobStateBadge state="CLOSED" />}</div>
+          <div className="application-progress">
+            <div className="inline-actions"><strong>Status terkini</strong><StatusBadge status={application.status} /></div>
+            <p>{statusDescriptions[application.status]}</p>
+            <p className="updated-label">Terakhir berubah <time dateTime={lastChange}>{date(lastChange)}</time></p>
+          </div>
+          <details><summary>Riwayat status <span className="count">{application.history.length}</span></summary>
+            <StageTimeline history={application.history} />
+          </details>
+        </li>;
+      })}</ul>}
   </>;
 }

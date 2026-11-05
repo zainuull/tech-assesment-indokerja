@@ -2,38 +2,41 @@ import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { ArrowRight, BriefcaseBusiness, Building2, ClipboardList, Compass, LogOut } from 'lucide-react';
 import { BrowserRouter, Link, NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom';
-import type { Role, Session, User } from '../shared/domain';
-import { api, ApiError, errorMessage } from './api';
-import { Candidates, CompanyDashboard, Field, fieldProps, JobForm } from './company';
+import type { Role, User } from '../shared/domain';
+import { api, ApiError, errorMessage, setRequestUser } from './api';
+import { CompanyDashboard, EditJob, JobForm } from './company';
+import { CandidatePage, Candidates } from './pipeline';
 import { CareerMap, JobDetail, JobList, MyApplications } from './jobs';
-import { Brand, Empty, Feedback } from './ui';
+import { Brand, Empty, Feedback, Field, fieldProps } from './ui';
 import './styles.css';
 
-const sessionKey = 'indokerja.token';
 const landing = (role: Role) => role === 'COMPANY' ? '/perusahaan' : '/';
-const initialToken = sessionStorage.getItem(sessionKey);
+try { sessionStorage.removeItem('indokerja.token'); } catch { /* Storage can be disabled. */ }
 
 function App() {
-  const [session, setSession] = useState<Session | null>(null);
-  const [checking, setChecking] = useState(!!initialToken);
+  const [session, setSession] = useState<User | null>(null);
+  const [checking, setChecking] = useState(true);
   const [sessionError, setSessionError] = useState('');
   const [attempt, setAttempt] = useState(0);
+  const [canRetrySession, setCanRetrySession] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
   const location = useLocation();
 
   useEffect(() => {
-    const token = sessionStorage.getItem(sessionKey);
-    if (!token) return;
     const controller = new AbortController();
-    api<User>('/auth/me', { token, signal: controller.signal }).then(
+    api<User>('/auth/me', { signal: controller.signal }).then(
       user => {
         if (controller.signal.aborted) return;
-        setSession({ token, user });
+        setRequestUser(user.id);
+        setSession(user);
         setChecking(false);
       },
       error => {
         if (controller.signal.aborted) return;
-        if (error instanceof ApiError && error.status === 401) sessionStorage.removeItem(sessionKey);
-        else setSessionError(errorMessage(error));
+        if (!(error instanceof ApiError && error.status === 401)) {
+          setCanRetrySession(true);
+          setSessionError(errorMessage(error));
+        }
         setChecking(false);
       },
     );
@@ -41,9 +44,9 @@ function App() {
   }, [attempt]);
 
   useEffect(() => {
-    function expired(event: Event) {
-      if ((event as CustomEvent).detail !== sessionStorage.getItem(sessionKey)) return;
-      sessionStorage.removeItem(sessionKey);
+    function expired() {
+      setRequestUser();
+      setCanRetrySession(false);
       setSession(null);
       setSessionError('Sesi berakhir. Silakan masuk kembali.');
     }
@@ -56,8 +59,9 @@ function App() {
     document.getElementById('main')?.focus({ preventScroll: true });
   }, [location.pathname]);
 
-  function signIn(next: Session) {
-    sessionStorage.setItem(sessionKey, next.token);
+  function signIn(next: User) {
+    setRequestUser(next.id);
+    setCanRetrySession(false);
     setSessionError('');
     setSession(next);
   }
@@ -70,17 +74,25 @@ function App() {
     return <Navigate to={landing(role)} replace />;
   }
 
-  function signOut() {
-    sessionStorage.removeItem(sessionKey);
-    setSession(null);
+  async function signOut() {
+    setSigningOut(true);
     setSessionError('');
+    try {
+      await api<void>('/auth/logout', { method: 'POST' });
+      setRequestUser();
+      setSession(null);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) setSessionError(errorMessage(error));
+    } finally {
+      setSigningOut(false);
+    }
   }
 
-  function protectedPage(role: Role, render: (token: string) => ReactNode) {
+  function protectedPage(role: Role, content: ReactNode) {
     if (checking) return <div className="pending" role="status">Memeriksa sesi…</div>;
     if (!session) return <Navigate to="/masuk" replace />;
-    if (session.user.role !== role) return <Empty title="Akses dibatasi"><p>Halaman ini hanya tersedia untuk peran yang sesuai.</p><Link className="button secondary" to={landing(session.user.role)}>Kembali ke halaman utama</Link></Empty>;
-    return render(session.token);
+    if (session.role !== role) return <Empty title="Akses dibatasi"><p>Halaman ini hanya tersedia untuk peran yang sesuai.</p><Link className="button secondary" to={landing(session.role)}>Kembali ke halaman utama</Link></Empty>;
+    return content;
   }
 
   return <>
@@ -89,24 +101,27 @@ function App() {
       <Link className="brand" to="/" aria-label="IndoKerja.id, beranda"><Brand /></Link>
       <nav className="main-nav" aria-label="Navigasi utama">
         <NavLink end to="/"><Compass size={17} aria-hidden="true" /> Lowongan</NavLink>
-        {session?.user.role === 'JOB_SEEKER' && <NavLink to="/lamaran"><ClipboardList size={17} aria-hidden="true" /> Lamaran saya</NavLink>}
-        {session?.user.role === 'COMPANY' && <NavLink to="/perusahaan"><Building2 size={17} aria-hidden="true" /> Perusahaan</NavLink>}
+        {session?.role === 'JOB_SEEKER' && <NavLink to="/lamaran"><ClipboardList size={17} aria-hidden="true" /> Lamaran saya</NavLink>}
+        {session?.role === 'COMPANY' && <NavLink to="/perusahaan"><Building2 size={17} aria-hidden="true" /> Perusahaan</NavLink>}
       </nav>
-      {session ? <div className="account"><span className="account-name" title={session.user.name}>{session.user.name}</span><button className="button secondary" type="button" onClick={signOut}><LogOut size={16} aria-hidden="true" /> Keluar</button></div> :
+      {session ? <div className="account"><span className="account-name" title={session.name}>{session.name}</span><button className="button secondary" type="button" disabled={signingOut} onClick={signOut}><LogOut size={16} aria-hidden="true" /> {signingOut ? 'Keluar…' : 'Keluar'}</button></div> :
         !checking && <Link className="button secondary sign-in" to="/masuk">Masuk <ArrowRight size={16} aria-hidden="true" /></Link>}
     </div></header>
     <main id="main" className="shell" tabIndex={-1}>
-      {sessionError && <div className="session-notice"><Feedback>{sessionError} {sessionStorage.getItem(sessionKey) && <button className="text-action" type="button" onClick={() => {
-        setSessionError(''); setChecking(true); setAttempt(value => value + 1);
+      {sessionError && <div className="session-notice"><Feedback>{sessionError} {canRetrySession && <button className="text-action" type="button" onClick={() => {
+        setSessionError(''); setCanRetrySession(false); setChecking(true); setAttempt(value => value + 1);
       }}>Coba lagi</button>}</Feedback></div>}
       <Routes>
         <Route path="/" element={<JobList />} />
-        <Route path="/masuk" element={checking ? <div className="pending" role="status">Memeriksa sesi…</div> : session ? signedInPage(session.user.role) : <Login onLogin={signIn} />} />
+        <Route path="/masuk" element={checking ? <div className="pending" role="status">Memeriksa sesi…</div> : session ? signedInPage(session.role) : <Login onLogin={signIn} />} />
         <Route path="/lowongan/:id" element={<JobDetail key={location.pathname} session={session} />} />
-        <Route path="/lamaran" element={protectedPage('JOB_SEEKER', token => <MyApplications token={token} />)} />
-        <Route path="/perusahaan" element={protectedPage('COMPANY', token => <CompanyDashboard token={token} />)} />
-        <Route path="/perusahaan/baru" element={protectedPage('COMPANY', token => <JobForm token={token} />)} />
-        <Route path="/perusahaan/lowongan/:id/kandidat" element={protectedPage('COMPANY', token => <Candidates token={token} />)} />
+        <Route path="/lamaran" element={protectedPage('JOB_SEEKER', <MyApplications />)} />
+        <Route path="/perusahaan" element={protectedPage('COMPANY', <CompanyDashboard />)} />
+        <Route path="/perusahaan/baru" element={protectedPage('COMPANY', <JobForm />)} />
+        <Route path="/perusahaan/lowongan/:id/edit" element={protectedPage('COMPANY', <EditJob />)} />
+        <Route path="/perusahaan/kandidat" element={protectedPage('COMPANY', <Candidates key={location.pathname} />)} />
+        <Route path="/perusahaan/kandidat/:applicationId" element={protectedPage('COMPANY', <CandidatePage />)} />
+        <Route path="/perusahaan/lowongan/:id/kandidat" element={protectedPage('COMPANY', <Candidates key={location.pathname} />)} />
         <Route path="*" element={<Empty title="Halaman tidak ditemukan"><p>Periksa alamat halaman atau kembali ke daftar lowongan.</p><Link className="button primary" to="/">Jelajahi lowongan</Link></Empty>} />
       </Routes>
     </main>
@@ -114,7 +129,7 @@ function App() {
   </>;
 }
 
-function Login({ onLogin }: { onLogin: (session: Session) => void }) {
+function Login({ onLogin }: { onLogin: (session: User) => void }) {
   const [busy, setBusy] = useState(false);
   const [fields, setFields] = useState<Record<string, string>>({});
   const [error, setError] = useState('');
@@ -126,7 +141,7 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
     setFields({});
     setError('');
     try {
-      onLogin(await api<Session>('/auth/login', { method: 'POST', body }));
+      onLogin(await api<User>('/auth/session', { method: 'POST', body }));
     } catch (error) {
       if (error instanceof ApiError) setFields(error.fields);
       setError(errorMessage(error));

@@ -46,7 +46,7 @@ Buka [http://localhost:3000](http://localhost:3000). Jika server development mas
 | Perusahaan lain | `studio@indokerja.test` | `IndoKerjaDemo!` |
 | Perusahaan lain | `nusa@indokerja.test` | `IndoKerjaDemo!` |
 
-Seed menyiapkan enam lowongan dan satu lamaran contoh. Menjalankan seed kembali mempertahankan lamaran, status, dan perubahan yang telah dibuat. Database hasil seed menggunakan kredensial publik khusus pengembangan lokal.
+Seed menyiapkan enam lowongan terbuka, satu draf, satu lowongan ditutup, dan tujuh lamaran contoh. Pipeline **Frontend Developer** berisi kandidat fiktif dalam kelima tahap seleksi. Menjalankan seed kembali mempertahankan lamaran, status, dan perubahan yang telah dibuat. Database hasil seed menggunakan kredensial publik khusus pengembangan lokal.
 
 ## Verifikasi
 
@@ -55,17 +55,22 @@ npm run build
 npm test
 ```
 
-Tes API membuat skema sementara, menjalankan migrasi, menggunakan HTTP melalui Express, lalu menghapus skema tes. Jalankan dengan PostgreSQL lokal yang mengizinkan pembuatan skema. Tes mencakup login, validasi, peran, kepemilikan data, filter, permintaan melamar serentak, perubahan status serentak, dan rantai riwayat.
+Tes API membuat skema sementara, menjalankan migrasi, menggunakan HTTP melalui Express, lalu menghapus skema tes. Jalankan dengan PostgreSQL lokal yang mengizinkan pembuatan skema. Tes mencakup login, validasi, peran, kepemilikan data, filter, permintaan melamar serentak, perubahan status serentak, rantai riwayat, privasi catatan internal, dan siklus lowongan.
 
 Untuk mencoba alur lengkap di browser:
 
-1. Masuk sebagai Perusahaan dan buat lowongan baru. Halaman kandidat akan menampilkan konfirmasi publikasi.
-2. Keluar, cari lowongan sebagai tamu, lalu pilih **Masuk untuk melamar** dari halaman detail. Masuk sebagai Pencari Kerja dan pastikan halaman detail terbuka kembali. Klik **Lamar sekarang**. Buka ulang detail untuk memeriksa keterangan bahwa lamaran sudah dikirim.
-3. Masuk lagi sebagai Perusahaan, buka daftar kandidat lowongan tadi, ubah status ke **Reviewing**, lalu ke **Accepted**.
-4. Masuk sebagai Pencari Kerja dan buka **Lamaran saya**. Periksa status **Accepted** dan buka **Riwayat status**.
+1. Masuk sebagai Perusahaan, lalu klik **Lamaran baru** dari dashboard untuk membuka pipeline dengan filter Applied. Coba cari nama dan buka detail kandidat untuk melihat riwayat serta menambahkan catatan internal.
+2. Buat lowongan dan pilih **Simpan draf** setelah mengisi formulir. Buka **Kelola** untuk mengeditnya, simpan perubahan, lalu pilih **Publikasikan draf**.
+3. Sebagai tamu, cari dan buka lowongan yang baru terbit, pilih **Masuk untuk melamar**, lalu masuk sebagai Pencari Kerja dan kirim lamaran.
+4. Masuk sebagai Perusahaan. Buka pipeline lowongan itu, ubah status kandidat, lalu tutup lowongan melalui menu **Kelola**.
+5. Sebagai Pencari Kerja, buka **Lamaran saya** untuk melihat status, waktu perubahan terakhir, dan riwayat. Detail lowongan yang ditutup menampilkan pemberitahuan bahwa penerimaan lamaran sudah berakhir.
+
+Untuk memperbarui instalasi yang sudah memiliki data, jalankan `npm run db:migrate`, `npm run build`, lalu mulai ulang server. Migrasi menandai lowongan lama sebagai Terbuka dan menambahkan tabel catatan. Setelah draf atau lowongan ditutup dibuat, gunakan versi server yang memahami status lowongan agar aturan visibilitas tetap berlaku. Jalankan `npm run db:seed` bila ingin menambahkan contoh demo baru ke database lokal.
 
 ## Keputusan implementasi
 
+- Draf dapat disimpan setelah detail wajib diisi. Draf bersifat privat, dan daftar publik hanya menampilkan lowongan terbuka. Detail lowongan ditutup tetap dapat dibuka melalui tautan langsung.
+- **Lamaran baru** menghitung Applied, sedangkan **Menunggu keputusan** menghitung Shortlisted. Keduanya mencakup lamaran yang masih perlu ditangani pada lowongan milik perusahaan.
 - Rentang gaji menggunakan bilangan bulat IDR per bulan. Jenis pekerjaan yang tersedia adalah penuh waktu, paruh waktu, kontrak, dan magang.
 - Lamaran dimulai dari `APPLIED`. Perusahaan pemilik lowongan dapat memilih setiap status yang valid. Menyimpan status yang sama mempertahankan riwayat yang sudah ada.
 - PostgreSQL menegakkan keunikan pasangan lowongan dan pelamar. Perubahan status dan riwayat disimpan bersama, dengan pengulangan transaksi terbatas ketika terjadi benturan.

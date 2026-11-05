@@ -1,12 +1,13 @@
 import 'dotenv/config';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, scryptSync } from 'node:crypto';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
-import type { Application, Job, Session } from '../shared/domain';
+import type { Application, Candidate, CandidateDetail, CandidateNote, Job, OwnedJob, Session } from '../shared/domain';
 import { createApp } from '../server/app';
 import { createDb } from '../server/db';
 import { hashPassword } from '../server/password';
@@ -30,8 +31,10 @@ test('REST workflow and database invariants', { timeout: 30_000 }, async t => {
 
   const password = 'Test password 123!';
   const passwordHash = await hashPassword(password);
+  const salt = randomBytes(16).toString('hex');
+  const legacyHash = `${salt}:${scryptSync(password, salt, 64).toString('hex')}`;
   await db.user.createMany({ data: [
-    { name: 'Ruang Digital', email: 'company@example.com', role: 'COMPANY', passwordHash },
+    { name: 'Ruang Digital', email: 'company@example.com', role: 'COMPANY', passwordHash: legacyHash },
     { name: 'Sagara Studio', email: 'other-company@example.com', role: 'COMPANY', passwordHash },
     { name: 'Raka Pratama', email: 'seeker@example.com', role: 'JOB_SEEKER', passwordHash },
   ] });
@@ -41,12 +44,13 @@ test('REST workflow and database invariants', { timeout: 30_000 }, async t => {
       ACCOUNT_EMAIL: 'other-seeker@example.com', ACCOUNT_ROLE: 'JOB_SEEKER', ACCOUNT_PASSWORD: password,
     },
   });
-  const server = createApp(db, randomBytes(32).toString('hex')).listen(0, '127.0.0.1');
+  const secret = randomBytes(32).toString('hex');
+  const server = createApp(db, secret).listen(0, '127.0.0.1');
   await once(server, 'listening');
   t.after(() => new Promise<void>((done, reject) => server.close(error => error ? reject(error) : done())));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
   async function request<T = { error: { code: string; fields?: Record<string, string> } }>(
-    path: string, status: number | null, options: { method?: string; token?: string; body?: unknown } = {},
+    path: string, status: number | null, options: { method?: string; token?: string; body?: unknown; headers?: Record<string, string> } = {},
   ) {
     const { method, token, body } = options;
     const response = await fetch(base + path, {
@@ -54,13 +58,15 @@ test('REST workflow and database invariants', { timeout: 30_000 }, async t => {
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        ...options.headers,
       },
       body: JSON.stringify(body),
     });
-    const data = await response.json() as T;
+    const data = (response.status === 204 ? undefined : await response.json()) as T;
     if (status !== null) assert.equal(response.status, status, `${method ?? 'GET'} ${path}: ${JSON.stringify(data)}`);
     assert.equal(response.headers.get('cache-control'), 'no-store');
-    return { status: response.status, data };
+    assert.match(response.headers.get('x-request-id') ?? '', /^[0-9a-f-]{36}$/i);
+    return { status: response.status, data, headers: response.headers };
   }
   const login = async (email: string) => (await request<Session>('/auth/login', 200, { method: 'POST', body: { email, password } })).data;
   const post = 'POST';
@@ -75,6 +81,10 @@ test('REST workflow and database invariants', { timeout: 30_000 }, async t => {
     await request('/missing', 404);
     await request('/jobs/invalid', 400);
     await request('/jobs?jobType=INVALID', 400);
+    await request('/jobs?page=0', 400);
+    await request('/jobs?limit=51', 400);
+    await request('/jobs?q=%00', 400);
+    await request('/auth/login', 415, { method: post, body: { email: 'seeker@example.com', password }, headers: { 'Content-Type': 'text/plain' } });
     assert.equal((await fetch(base + '/auth/login', {
       method: post, headers: { 'Content-Type': 'application/json' }, body: '{',
     })).status, 400);
@@ -86,6 +96,8 @@ test('REST workflow and database invariants', { timeout: 30_000 }, async t => {
   assert.equal(company.user.role, 'COMPANY');
   assert.equal(seeker.user.role, 'JOB_SEEKER');
   assert.equal('passwordHash' in seeker.user, false);
+  const upgraded = await db.user.findUniqueOrThrow({ where: { id: company.user.id }, select: { passwordHash: true } });
+  assert.match(upgraded.passwordHash, /^scrypt-v2:/);
 
   const input = { title: 'Frontend Developer', description: 'Build accessible web products.', location: 'Jakarta', jobType: 'FULL_TIME', salaryMin: 10, salaryMax: 20 };
   const badSalary = await request('/jobs', 400, { method: post, token: company.token, body: { ...input, salaryMax: 0 } });
@@ -108,6 +120,9 @@ test('REST workflow and database invariants', { timeout: 30_000 }, async t => {
   await request(candidatesPath, 404, { token: otherCompany.token });
   await request('/applications/me', 403, { token: company.token });
 
+  const applicationStatePath = `${jobPath}/application`;
+  assert.deepEqual((await request(applicationStatePath, 200, { token: seeker.token })).data, { state: 'OPEN', applied: false });
+  await request(applicationStatePath, 403, { token: company.token });
   const submission = { method: post, token: seeker.token, body: { seekerId: otherSeeker.user.id } };
   const [first, second] = await Promise.all([
     request<Application>(candidatesPath, null, submission), request<Application>(candidatesPath, null, submission),
@@ -118,6 +133,8 @@ test('REST workflow and database invariants', { timeout: 30_000 }, async t => {
   assert.deepEqual(application.history.map(entry => [entry.fromStatus, entry.toStatus]), [[null, 'APPLIED']]);
   const duplicate = await request(candidatesPath, 409, submission);
   assert.equal(duplicate.data.error.code, 'ALREADY_APPLIED');
+  assert.deepEqual((await request(applicationStatePath, 200, { token: seeker.token })).data, { state: 'OPEN', applied: true });
+  assert.deepEqual((await request(applicationStatePath, 200, { token: otherSeeker.token })).data, { state: 'OPEN', applied: false });
 
   const { data: candidates } = await request<Job & { applications: { seeker: { email: string } }[] }>(candidatesPath, 200, { token: company.token });
   assert.equal(candidates.applications.length, 1);
@@ -142,4 +159,162 @@ test('REST workflow and database invariants', { timeout: 30_000 }, async t => {
   assert.deepEqual(current.history.slice(1).map(entry => entry.fromStatus), current.history.slice(0, -1).map(entry => entry.toStatus));
   assert.equal((await update('ACCEPTED')).data.history.length, 4);
   assert.deepEqual((await request<Application[]>('/applications/me', 200, { token: otherSeeker.token })).data, []);
+
+  await t.test('candidate pipeline and private notes', async () => {
+    const { data: owned } = await request<OwnedJob[]>('/jobs/mine', 200, { token: company.token });
+    assert.deepEqual(owned[0].stageCounts, { ACCEPTED: 1 });
+    assert.equal(owned[0]._count.applications, 1);
+    const { data: pipeline } = await request<Candidate[]>('/applications/company', 200, { token: company.token });
+    assert.deepEqual(pipeline.map(candidate => [candidate.id, candidate.job.id, candidate.status]), [[application.id, job.id, 'ACCEPTED']]);
+    assert.deepEqual((await request<Candidate[]>('/applications/company', 200, { token: otherCompany.token })).data, []);
+    await request('/applications/company', 403, { token: seeker.token });
+
+    const profile = `/applications/${application.id}`;
+    const notes = `${profile}/notes`;
+    await request(profile, 404, { token: otherCompany.token });
+    await request(profile, 403, { token: seeker.token });
+    await request(notes, 404, { method: post, token: otherCompany.token, body: { body: 'Tidak berwenang' } });
+    await request(notes, 403, { method: post, token: seeker.token, body: { body: 'Tidak berwenang' } });
+    await request(notes, 400, { method: post, token: company.token, body: { body: '   ' } });
+    const internal = 'Catatan penilaian internal yang tidak boleh dibaca pelamar.';
+    const { data: note } = await request<CandidateNote>(notes, 201, { method: post, token: company.token, body: { body: `  ${internal}  ` } });
+    const { data: candidate } = await request<CandidateDetail>(profile, 200, { token: company.token });
+    assert.equal(note.body, internal);
+    assert.deepEqual(candidate.notes, [note]);
+    assert.deepEqual(candidate.history, current.history);
+    const { data: applicantView } = await request<Application[]>('/applications/me', 200, { token: seeker.token });
+    assert.equal(JSON.stringify(applicantView).includes(internal), false);
+    assert.equal('notes' in applicantView[0], false);
+  });
+
+  await t.test('job lifecycle and preserved application history', async () => {
+    assert.equal(job.state, 'OPEN');
+    const { data: draft } = await request<Job>('/jobs', 201, { method: post, token: company.token, body: { ...input, title: 'Draf QA', state: 'DRAFT' } });
+    const draftPath = `/jobs/${draft.id}`;
+    const draftState = `${draftPath}/state`;
+    const draftApply = `${draftPath}/applications`;
+    const changeState = (path: string, state: 'OPEN' | 'CLOSED') =>
+      request<Job>(path, 200, { method: patch, token: company.token, body: { state } });
+
+    assert.equal(draft.state, 'DRAFT');
+    await request(draftPath, 404);
+    await request(draftApply, 404, { method: post, token: seeker.token });
+    await request(`${draftPath}/manage`, 404, { token: otherCompany.token });
+    await request(`${draftPath}/manage`, 403, { token: seeker.token });
+    assert.equal((await request<Job>(`${draftPath}/manage`, 200, { token: company.token })).data.state, 'DRAFT');
+    assert.deepEqual((await request<Job[]>('/jobs?q=Draf', 200)).data, []);
+    await request(draftPath, 404, { method: patch, token: otherCompany.token, body: input });
+    await request(draftPath, 403, { method: patch, token: seeker.token, body: input });
+    await request(draftState, 404, { method: patch, token: otherCompany.token, body: { state: 'OPEN' } });
+    await request(draftState, 409, { method: patch, token: company.token, body: { state: 'CLOSED' } });
+    const { data: edited } = await request<Job>(draftPath, 200, {
+      method: patch, token: company.token, body: { ...input, title: 'QA Engineer', state: 'OPEN' },
+    });
+    assert.equal(edited.state, 'DRAFT');
+    assert.equal(edited.title, 'QA Engineer');
+    assert.equal((await changeState(draftState, 'OPEN')).data.state, 'OPEN');
+    assert.equal((await request<Job>(draftPath, 200)).data.title, 'QA Engineer');
+
+    assert.equal((await changeState(`${jobPath}/state`, 'CLOSED')).data.state, 'CLOSED');
+    const { data: closed } = await request(candidatesPath, 409, { method: post, token: otherSeeker.token });
+    assert.equal(closed.error.code, 'JOB_CLOSED');
+    assert.equal((await request<Job>(jobPath, 200)).data.state, 'CLOSED');
+    assert.equal((await request<Job[]>('/jobs', 200)).data.some(item => item.id === job.id), false);
+    const { data: kept } = await request<(Application & { job: Job })[]>('/applications/me', 200, { token: seeker.token });
+    assert.equal(kept[0].job.state, 'CLOSED');
+    assert.deepEqual(kept[0].history, current.history);
+    await request(candidatesPath, 200, { token: company.token });
+    await assert.rejects(
+      db.application.create({ data: { jobId: job.id, seekerId: otherSeeker.user.id } }),
+      { code: 'P2004' },
+    );
+    assert.equal((await changeState(`${jobPath}/state`, 'OPEN')).data.state, 'OPEN');
+    await request(candidatesPath, 201, { method: post, token: otherSeeker.token });
+  });
+
+  await t.test('bounded pagination keeps filters and order', async () => {
+    const first = await request<Job[]>('/jobs?location=Jakarta&limit=1', 200);
+    assert.equal(first.data.length, 1);
+    const next = first.headers.get('link')?.match(/<([^>]+)>; rel="next"/)?.[1];
+    assert.equal(next, '/api/jobs?page=2&limit=1&location=Jakarta');
+    const second = await request<Job[]>(next!.slice('/api'.length), 200);
+    assert.equal(second.data.length, 1);
+    assert.notEqual(second.data[0].id, first.data[0].id);
+    assert.match(second.headers.get('link') ?? '', /rel="prev"/);
+    assert.doesNotMatch(second.headers.get('link') ?? '', /rel="next"/);
+  });
+
+  await t.test('browser sessions are private, guarded, and revocable', async () => {
+    const loginBody = { email: 'company@example.com', password };
+    const browser = { 'X-IndoKerja-Request': '1' };
+    await request('/auth/session', 403, { method: post, body: loginBody });
+    await request('/auth/session', 403, { method: post, body: loginBody, headers: { ...browser, 'Sec-Fetch-Site': 'cross-site' } });
+    const { data: browserUser, headers } = await request('/auth/session', 200, { method: post, body: loginBody, headers: browser });
+    assert.deepEqual(browserUser, company.user);
+    const issued = headers.get('set-cookie') ?? '';
+    assert.match(issued, /^indokerja_session=[\w-]{43};/);
+    assert.match(issued, /HttpOnly/);
+    assert.match(issued, /SameSite=Strict/);
+    const cookie = issued.split(';')[0];
+    const token = cookie.split('=')[1];
+    assert.equal(await db.authSession.count({ where: { tokenHash: token } }), 0);
+    await request('/auth/me', 200, { headers: { Cookie: cookie } });
+    await request('/jobs', 403, { method: post, body: input, headers: { Cookie: cookie } });
+    await request('/jobs', 401, { method: post, body: input, headers: { Cookie: cookie, ...browser, 'X-IndoKerja-User': otherCompany.user.id } });
+    await request('/auth/logout', 403, { method: post, headers: { Cookie: cookie } });
+    await request('/auth/logout', 401, { method: post, headers: { Cookie: cookie, ...browser, 'X-IndoKerja-User': otherCompany.user.id } });
+    await request('/auth/me', 200, { headers: { Cookie: cookie } });
+    const logout = await request('/auth/logout', 204, { method: post, headers: { Cookie: cookie, ...browser } });
+    assert.match(logout.headers.get('set-cookie') ?? '', /^indokerja_session=;/);
+    await request('/auth/me', 401, { headers: { Cookie: cookie } });
+    await request('/auth/logout', 204, { method: post, token: seeker.token });
+    await request('/auth/me', 401, { token: seeker.token });
+    await db.authSession.updateMany({ where: { userId: otherCompany.user.id }, data: { expiresAt: new Date(0) } });
+    await request('/auth/me', 401, { token: otherCompany.token });
+
+    const secure = createApp(db, secret, false, true).listen(0, '127.0.0.1');
+    await once(secure, 'listening');
+    t.after(() => new Promise<void>(done => secure.close(() => done())));
+    const response = await fetch(`http://127.0.0.1:${(secure.address() as AddressInfo).port}/api/auth/session`, {
+      method: post, headers: { ...browser, 'Content-Type': 'application/json' }, body: JSON.stringify(loginBody),
+    });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('set-cookie') ?? '', /^__Host-indokerja_session=.*; Secure/);
+    await response.json();
+  });
+
+  await t.test('database serializes an application against a closing job', async () => {
+    const lock = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const closing = db.$transaction(async tx => {
+      await tx.job.update({ where: { id: job.id }, data: { state: 'CLOSED' } });
+      lock.resolve();
+      await release.promise;
+    }, { timeout: 8_000 });
+    await lock.promise;
+    const submitted = db.application.create({ data: { jobId: job.id, seekerId: company.user.id } }).then(
+      () => undefined,
+      error => error,
+    );
+    let blocked = false;
+    try {
+      for (let attempt = 0; attempt < 40 && !blocked; attempt++) {
+        const [result] = await db.$queryRaw<{ blocked: boolean }[]>`
+          SELECT EXISTS (
+            SELECT 1 FROM pg_stat_activity
+            WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock'
+              AND strpos(query, ${`"${schema}"."Application"`}) > 0
+          ) AS blocked
+        `;
+        blocked = result.blocked;
+        if (!blocked) await delay(50);
+      }
+    } finally {
+      release.resolve();
+      await closing;
+    }
+    assert.equal(blocked, true);
+    assert.equal((await submitted)?.code, 'P2004');
+    assert.equal(await db.application.count({ where: { jobId: job.id, seekerId: company.user.id } }), 0);
+  });
 });
