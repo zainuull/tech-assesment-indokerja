@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+generated/
+/Tech Assesment Indokerja.pdf
+/PRD_Job_Application_Management_IndoKerja.docx
+/RFD_Job_Application_Management_IndoKerja.docx
