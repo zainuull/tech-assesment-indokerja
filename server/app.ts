@@ -7,6 +7,10 @@ import { currentUser, registerAuth } from './auth';
 import { ApiError, createJobSchema, idSchema, jobSchema, jobStateSchema, noteSchema, requireJson, searchSchema, statusSchema, validate, validateJson } from './validation';
 
 const company = { select: { id: true, name: true } } as const;
+const jobFields = {
+  id: true, companyId: true, company, title: true, description: true, location: true,
+  salaryMin: true, salaryMax: true, jobType: true, state: true, createdAt: true, updatedAt: true,
+} as const;
 const history = {
   select: { id: true, fromStatus: true, toStatus: true, changedAt: true },
   orderBy: { id: 'asc' },
@@ -24,6 +28,12 @@ const jobMissing = () => new ApiError(404, 'JOB_NOT_FOUND', 'Lowongan tidak dite
 const applicationMissing = () => new ApiError(404, 'APPLICATION_NOT_FOUND', 'Lamaran tidak ditemukan.');
 const prismaError = (error: unknown, code: string) =>
   error instanceof Prisma.PrismaClientKnownRequestError && error.code === code;
+
+function isClosedJobCheck(error: unknown) {
+  if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2039') return false;
+  const adapter = error.meta?.driverAdapterError as { cause?: { originalCode?: string; originalMessage?: string } } | undefined;
+  return adapter?.cause?.originalCode === '23514' && adapter.cause.originalMessage === 'Application requires an open job.';
+}
 
 async function serializable<T>(db: PrismaClient, action: (tx: Prisma.TransactionClient) => Promise<T>, conflict: ApiError) {
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -78,7 +88,7 @@ export function createApp(db: PrismaClient, secret: string, trustProxy = false, 
         location: location ? contains(location) : undefined,
         OR: q ? [{ title: contains(q) }, { company: { name: contains(q) } }] : undefined,
       },
-      include: { company },
+      select: jobFields,
       orderBy: [{ createdAt: 'desc' }, { id: 'asc' }],
       skip: (page - 1) * limit,
       take: limit + 1,
@@ -106,7 +116,7 @@ export function createApp(db: PrismaClient, secret: string, trustProxy = false, 
     const [jobs, stages] = await db.$transaction([
       db.job.findMany({
         where: { companyId },
-        include: { company, _count: { select: { applications: true } } },
+        select: { ...jobFields, _count: { select: { applications: true } } },
         orderBy: [{ createdAt: 'desc' }, { id: 'asc' }],
       }),
       groupedStages,
@@ -122,14 +132,14 @@ export function createApp(db: PrismaClient, secret: string, trustProxy = false, 
 
   app.get('/api/jobs/:jobId/manage', auth(Role.COMPANY), async (req, res) => {
     const id = validate(idSchema, req.params.jobId);
-    const job = await db.job.findUnique({ where: { id, companyId: currentUser(res).id }, include: { company } });
+    const job = await db.job.findUnique({ where: { id, companyId: currentUser(res).id }, select: jobFields });
     if (!job) throw jobMissing();
     res.json(job);
   });
 
   app.get('/api/jobs/:jobId', async (req, res) => {
     const id = validate(idSchema, req.params.jobId);
-    const job = await db.job.findUnique({ where: { id, state: { not: JobState.DRAFT } }, include: { company } });
+    const job = await db.job.findUnique({ where: { id, state: { not: JobState.DRAFT } }, select: jobFields });
     if (!job) throw jobMissing();
     res.json(job);
   });
@@ -138,7 +148,7 @@ export function createApp(db: PrismaClient, secret: string, trustProxy = false, 
     const data = validateJson(createJobSchema, req);
     const job = await db.job.create({
       data: { ...data, companyId: currentUser(res).id },
-      include: { company },
+      select: jobFields,
     });
     res.status(201).json(job);
   });
@@ -149,7 +159,7 @@ export function createApp(db: PrismaClient, secret: string, trustProxy = false, 
     try {
       const job = await db.job.update({
         where: { id, companyId: currentUser(res).id },
-        data, include: { company },
+        data, select: jobFields,
       });
       res.json(job);
     } catch (error) {
@@ -165,7 +175,7 @@ export function createApp(db: PrismaClient, secret: string, trustProxy = false, 
     try {
       const job = await db.job.update({
         where: { ...owner, state: state === JobState.CLOSED ? { not: JobState.DRAFT } : undefined },
-        data: { state }, include: { company },
+        data: { state }, select: jobFields,
       });
       res.json(job);
     } catch (error) {
@@ -206,7 +216,7 @@ export function createApp(db: PrismaClient, secret: string, trustProxy = false, 
       res.status(201).json(application);
     } catch (error) {
       if (prismaError(error, 'P2002')) throw new ApiError(409, 'ALREADY_APPLIED', 'Kamu sudah melamar lowongan ini.');
-      if (prismaError(error, 'P2004')) throw new ApiError(409, 'JOB_CLOSED', 'Lowongan ini sudah ditutup.');
+      if (isClosedJobCheck(error)) throw new ApiError(409, 'JOB_CLOSED', 'Lowongan ini sudah ditutup.');
       throw error;
     }
   });
@@ -214,7 +224,7 @@ export function createApp(db: PrismaClient, secret: string, trustProxy = false, 
   app.get('/api/applications/me', auth(Role.JOB_SEEKER), async (_req, res) => {
     const applications = await db.application.findMany({
       where: { seekerId: currentUser(res).id },
-      include: { job: { include: { company } }, history },
+      include: { job: { select: jobFields }, history },
       orderBy: [{ appliedAt: 'desc' }, { id: 'asc' }],
     });
     res.json(applications);
@@ -224,8 +234,8 @@ export function createApp(db: PrismaClient, secret: string, trustProxy = false, 
     const id = validate(idSchema, req.params.jobId);
     const job = await db.job.findUnique({
       where: { id, companyId: currentUser(res).id },
-      include: {
-        company,
+      select: {
+        ...jobFields,
         applications: {
           select: candidate,
           orderBy: candidateOrder,

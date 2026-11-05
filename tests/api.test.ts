@@ -226,7 +226,7 @@ test('REST workflow and database invariants', { timeout: 30_000 }, async t => {
     await request(candidatesPath, 200, { token: company.token });
     await assert.rejects(
       db.application.create({ data: { jobId: job.id, seekerId: otherSeeker.user.id } }),
-      { code: 'P2004' },
+      { code: 'P2039', message: /Application requires an open job/ },
     );
     assert.equal((await changeState(`${jobPath}/state`, 'OPEN')).data.state, 'OPEN');
     await request(candidatesPath, 201, { method: post, token: otherSeeker.token });
@@ -284,15 +284,20 @@ test('REST workflow and database invariants', { timeout: 30_000 }, async t => {
   });
 
   await t.test('database serializes an application against a closing job', async () => {
-    const lock = Promise.withResolvers<void>();
-    const release = Promise.withResolvers<void>();
+    const applicant = await db.user.create({
+      data: { name: 'Pelamar serentak', email: 'race@example.com', role: 'JOB_SEEKER', passwordHash },
+    });
+    let markLocked!: () => void;
+    let release!: () => void;
+    const locked = new Promise<void>(resolve => { markLocked = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
     const closing = db.$transaction(async tx => {
       await tx.job.update({ where: { id: job.id }, data: { state: 'CLOSED' } });
-      lock.resolve();
-      await release.promise;
+      markLocked();
+      await gate;
     }, { timeout: 8_000 });
-    await lock.promise;
-    const submitted = db.application.create({ data: { jobId: job.id, seekerId: company.user.id } }).then(
+    await Promise.race([locked, closing]);
+    const submitted = db.application.create({ data: { jobId: job.id, seekerId: applicant.id } }).then(
       () => undefined,
       error => error,
     );
@@ -310,11 +315,14 @@ test('REST workflow and database invariants', { timeout: 30_000 }, async t => {
         if (!blocked) await delay(50);
       }
     } finally {
-      release.resolve();
+      release();
       await closing;
     }
     assert.equal(blocked, true);
-    assert.equal((await submitted)?.code, 'P2004');
-    assert.equal(await db.application.count({ where: { jobId: job.id, seekerId: company.user.id } }), 0);
+    const error = await submitted;
+    assert.equal(error?.code, 'P2039');
+    assert.equal(error.meta?.driverAdapterError?.cause?.originalCode, '23514');
+    assert.equal(error.meta?.driverAdapterError?.cause?.originalMessage, 'Application requires an open job.');
+    assert.equal(await db.application.count({ where: { jobId: job.id, seekerId: applicant.id } }), 0);
   });
 });
